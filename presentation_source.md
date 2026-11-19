@@ -7,7 +7,7 @@ In vielen Unternehmen, Vereinen, Communities und Projektteams laufen wichtige An
 Der **Facebook Group Analyzer** automatisiert die komplette Kette von der Datenerfassung über die strukturierte KI-Bewertung bis zur übersichtlichen Aufgabenverwaltung:
 - Kontinuierliche, automatische Überwachung einer Facebook-Gruppe (Standard: alle 20 Minuten)
 - Zuverlässige Erfassung neuer Beiträge **und** neuer Kommentare ohne doppelte Verarbeitung
-- Datenschutzkonforme (DSGVO) Anonymisierung personenbezogener Daten vor der KI-Analyse
+- Optionale Gemini-Analyse mit Maskierung typischer Identifikatoren
 - Automatische Ableitung strukturierter, handlungsrelevanter Aktivitäten (Kategorie, Priorität, Titel, Details, Fälligkeitsdatum)
 - Zentrale Übersicht im interaktiven **Streamlit-Dashboard** sowie Export als CSV oder per Webhook (z. B. Teams, E-Mail, n8n, Make)
 
@@ -28,8 +28,8 @@ Der **Facebook Group Analyzer** automatisiert die komplette Kette von der Datene
 - **Intelligente Deduplizierung:** Bereits bekannte Beiträge werden nicht erneut an die KI gesendet – außer es sind neue Kommentare oder Textänderungen hinzugekommen. Das spart API-Kosten und verhindert doppelte Aufgaben.
 
 ### Schicht 4: KI-Analyse & Datenschutz (`analyzer.py`)
-- **DSGVO-PII-Anonymisierung (`ANONYMIZE_PII=true`):** Bevor Texte an das Cloud-LLM übermittelt werden, maskiert das Skript automatisch Klarnamen (`[Autor]`, `[Kommentator N]`, `[Person_N]`), E-Mail-Adressen (`[E-MAIL]`), Telefonnummern (`[TELEFON]`) und Facebook-Profil-URLs (`[PROFIL-URL]`).
-- **Structured Outputs mit Google Gemini & Pydantic:** Das Modell (`gemini-2.5-flash`) liefert garantiert valides JSON gemäß dem Schema `DerivedActivity`:
+- **Cloud-Analyse mit Freigabe (`GEMINI_ALLOW_CLOUD=true`):** Vor dem Versand maskiert das Skript bekannte Autorennamen, E-Mail-Adressen, typische Telefonnummern und Weblinks. Freitext kann weiterhin identifizierende Angaben enthalten. Die Originaldaten bleiben in der lokalen Datenbank.
+- **Structured Outputs mit Google Gemini & Pydantic:** Das Modell (`gemini-2.5-flash`) erhält das Schema `DerivedActivity`. Die Pipeline prüft die Antwort anschließend mit Pydantic.
   - `is_actionable` (bool): Liegt eine konkrete Aufgabe, Frage, Anfrage oder ein Termin vor?
   - `category`: `Termin/Event` | `Frage/Support` | `Bedarf/Anfrage` | `To-Do` | `Info`
   - `action_title`: Kurzer, prägnanter Titel

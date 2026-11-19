@@ -46,24 +46,24 @@ class DerivedActivity(BaseModel):
 
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,}[\s.-]?\d{2,}")
-_FB_PROFILE_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/(?:profile\.php\?id=\d+|[A-Za-z0-9.]+)")
+_URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>]+", re.IGNORECASE)
 
 
 def anonymize_text(text: str, known_names: Optional[List[str]] = None) -> str:
-    """Entfernt bzw. maskiert personenbezogene Daten vor der Übergabe an ein Cloud-LLM (DSGVO)."""
+    """Maskiert bekannte Namen und typische Identifikatoren im Freitext."""
     result = text
     result = _EMAIL_RE.sub("[E-MAIL]", result)
-    result = _FB_PROFILE_RE.sub("[PROFIL-URL]", result)
+    result = _URL_RE.sub("[LINK]", result)
     result = _PHONE_RE.sub("[TELEFON]", result)
 
     if known_names:
         for idx, name in enumerate(sorted(set(n for n in known_names if n and len(n) >= 3), key=len, reverse=True), start=1):
-            result = re.sub(re.escape(name), f"[Person_{idx}]", result, flags=re.IGNORECASE)
+            result = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", f"[Person_{idx}]", result, flags=re.IGNORECASE)
 
     return result
 
 
-def build_prompt(post: Dict, anonymize: bool = True) -> str:
+def build_prompt(post: Dict) -> str:
     author = post.get("author") or "Unbekannt"
     content = post.get("content") or ""
     timestamp = post.get("timestamp") or "unbekannt"
@@ -75,22 +75,12 @@ def build_prompt(post: Dict, anonymize: bool = True) -> str:
 
     known_names = [author] + [c.get("author", "") for c in comments if isinstance(c, dict)]
 
-    if anonymize:
-        display_author = "[Autor]"
-        display_content = anonymize_text(content, known_names)
-        comment_lines = [
-            f"- [Kommentator {i}]: {anonymize_text(c.get('text', ''), known_names)}"
-            for i, c in enumerate(comments, start=1)
-            if isinstance(c, dict) and c.get("text")
-        ]
-    else:
-        display_author = author
-        display_content = content
-        comment_lines = [
-            f"- {c.get('author', 'Unbekannt')}: {c.get('text', '')}"
-            for c in comments
-            if isinstance(c, dict) and c.get("text")
-        ]
+    display_content = anonymize_text(content, known_names)
+    comment_lines = [
+        f"- [Kommentator {i}]: {anonymize_text(c.get('text', ''), known_names)}"
+        for i, c in enumerate(comments, start=1)
+        if isinstance(c, dict) and c.get("text")
+    ]
 
     comments_block = "\n".join(comment_lines) if comment_lines else "(Keine Kommentare)"
 
@@ -99,7 +89,6 @@ def build_prompt(post: Dict, anonymize: bool = True) -> str:
         f"Analysiere den folgenden Beitrag aus einer Facebook-Gruppe samt Kommentaren "
         f"und leite daraus eine strukturierte Aktivität ab.\n\n"
         f"Zeitstempel: {timestamp}\n"
-        f"Autor: {display_author}\n"
         f"Beitrag:\n{display_content}\n\n"
         f"Kommentare:\n{comments_block}\n"
     )
@@ -107,12 +96,15 @@ def build_prompt(post: Dict, anonymize: bool = True) -> str:
 
 def analyze_pending_posts(db_path: Optional[str] = None, limit: int = 50, force_all: bool = False) -> int:
     """Analysiert noch nicht ausgewertete (oder bei force_all alle) Posts in state.db via Gemini Structured Outputs."""
+    if os.getenv("GEMINI_ALLOW_CLOUD", "").strip().lower() != "true":
+        print("[Analyzer] Gemini-Übertragung deaktiviert. Beiträge bleiben zur Analyse vorgemerkt.")
+        return 0
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key == "your_gemini_api_key_here":
         raise ValueError("GEMINI_API_KEY ist nicht konfiguriert. Bitte in .env eintragen.")
 
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    anonymize = os.getenv("ANONYMIZE_PII", "true").lower() == "true"
 
     db = StateDB(db_path or os.getenv("DB_PATH", "./state.db"))
     pending = db.get_all_posts()[:limit] if force_all else db.get_posts_for_analysis(limit=limit)
@@ -125,7 +117,7 @@ def analyze_pending_posts(db_path: Optional[str] = None, limit: int = 50, force_
 
     for post in pending:
         post_id = post["post_id"]
-        prompt = build_prompt(post, anonymize=anonymize)
+        prompt = build_prompt(post)
 
         try:
             response = client.models.generate_content(

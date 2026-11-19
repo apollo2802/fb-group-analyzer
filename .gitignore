@@ -6,5 +6,6 @@ __pycache__/
 *.log
 fb_session/
 state.db
+state.db-*
 activities.csv
 debug_graphql/

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
-from datetime import datetime, timezone
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -30,18 +32,52 @@ CSV_COLUMNS = [
 ]
 
 
-def _append_to_csv(csv_path: Path, row: Dict[str, Any]) -> None:
-    file_exists = csv_path.exists()
+def _export_key(row: Dict[str, Any]) -> tuple[str, str]:
+    return row["post_id"], row["dispatched_at"]
+
+
+def _export_csv(db: StateDB, csv_path: Path, records: List[Dict[str, Any]]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({col: row.get(col, "") for col in CSV_COLUMNS})
+    # Scheduler und Dashboard können dieselbe Pipeline gleichzeitig starten.
+    with db.write_transaction():
+        has_csv = csv_path.exists() and csv_path.stat().st_size > 0
+        existing_keys = set()
+        if has_csv:
+            with csv_path.open(newline="", encoding="utf-8") as source:
+                reader = csv.DictReader(source)
+                if reader.fieldnames != CSV_COLUMNS:
+                    raise ValueError(f"Unerwartete CSV-Spalten in {csv_path}")
+                existing_keys = {_export_key(row) for row in reader}
+        new_records = [row for row in records if _export_key(row) not in existing_keys]
+        if not new_records:
+            return
+
+        # Die vorhandene Historie bleibt auch bei einem Abbruch beim Schreiben intakt.
+        temporary_file = tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", dir=csv_path.parent, delete=False,
+        )
+        temporary_path = Path(temporary_file.name)
+        try:
+            with temporary_file as output:
+                writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
+                if has_csv:
+                    with csv_path.open(newline="", encoding="utf-8") as source:
+                        shutil.copyfileobj(source, output)
+                else:
+                    writer.writeheader()
+                writer.writerows(new_records)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary_path.replace(csv_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _send_webhook(webhook_url: str, payload: Dict[str, Any]) -> None:
-    response = httpx.post(webhook_url, json=payload, timeout=15.0)
+    delivery_key = hashlib.sha256(json.dumps(_export_key(payload)).encode()).hexdigest()
+    response = httpx.post(
+        webhook_url, json=payload, headers={"Idempotency-Key": delivery_key}, timeout=15.0,
+    )
     response.raise_for_status()
 
 
@@ -61,7 +97,7 @@ def dispatch_activities(
         print("[Dispatcher] Keine neuen Aktivitäten zum Weiterleiten vorhanden.")
         return 0
 
-    dispatched_count = 0
+    records = []
     for post in posts:
         post_id = post["post_id"]
         try:
@@ -70,8 +106,8 @@ def dispatch_activities(
             print(f"[Dispatcher] Ungültiges JSON für Post {post_id}: {exc}")
             continue
 
-        record = {
-            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+        records.append({
+            "dispatched_at": post["export_started_at"],
             "post_id": post_id,
             "post_timestamp": post.get("timestamp") or "",
             "post_url": post.get("post_url") or "",
@@ -83,20 +119,25 @@ def dispatch_activities(
             "due_date": action.get("due_date") or "",
             "action_title": action.get("action_title", ""),
             "details": action.get("details", ""),
-        }
+        })
 
+    if not records:
+        return 0
+    _export_csv(db, csv_path, records)
+
+    dispatched_count = 0
+    for record in records:
+        post_id, export_started_at = _export_key(record)
         try:
-            _append_to_csv(csv_path, record)
-
             if webhook and (not only_actionable_to_webhook or record["is_actionable"]):
                 _send_webhook(webhook, record)
 
-            db.mark_dispatched(post_id)
+            db.mark_dispatched(post_id, export_started_at)
             dispatched_count += 1
         except Exception as exc:
             print(f"[Dispatcher] Fehler beim Weiterleiten von Post {post_id}: {exc}")
 
-    print(f"[Dispatcher] Fertig: {dispatched_count} Einträge nach {csv_path} exportiert.")
+    print(f"[Dispatcher] Fertig: {dispatched_count}/{len(records)} Exporte abgeschlossen ({csv_path}).")
     return dispatched_count
 
 

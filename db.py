@@ -1,8 +1,9 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 class StateDB:
@@ -17,8 +18,19 @@ class StateDB:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def write_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Serialisiert Schreibzugriffe über mehrere Pipeline-Prozesse hinweg."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self.write_transaction() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS posts (
@@ -32,20 +44,21 @@ class StateDB:
                     extracted_actions TEXT,
                     needs_analysis INTEGER DEFAULT 1,
                     dispatched INTEGER DEFAULT 0,
+                    export_started_at TEXT,
                     status TEXT DEFAULT 'open',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
-            # Migration für bestehende Datenbanken ohne status-Spalte
             cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(posts)").fetchall()
             }
             if "status" not in cols:
                 conn.execute("ALTER TABLE posts ADD COLUMN status TEXT DEFAULT 'open'")
-            conn.commit()
+            if "export_started_at" not in cols:
+                conn.execute("ALTER TABLE posts ADD COLUMN export_started_at TEXT")
 
     def upsert_post(
         self,
@@ -63,9 +76,9 @@ class StateDB:
         Gibt True zurück, wenn der Post neu ist oder aktualisiert wurde.
         """
         now = datetime.now(timezone.utc).isoformat()
-        comments_json = json.dumps(comments or [], ensure_ascii=False)
+        incoming_comments = comments or []
 
-        with self._connect() as conn:
+        with self.write_transaction() as conn:
             row = conn.execute(
                 "SELECT content, comment_count, comments FROM posts WHERE post_id = ?",
                 (post_id,),
@@ -84,7 +97,7 @@ class StateDB:
                         post_id,
                         author,
                         content,
-                        comments_json,
+                        json.dumps(incoming_comments, ensure_ascii=False),
                         timestamp,
                         comment_count,
                         post_url,
@@ -92,18 +105,22 @@ class StateDB:
                         now,
                     ),
                 )
-                conn.commit()
                 return True
 
-            # Nur neu analysieren, wenn neue Kommentare oder neuer Inhalt dazugekommen sind
             prev_count = row["comment_count"] or 0
             prev_content = row["content"] or ""
-            prev_comments = row["comments"] or "[]"
+            stored_comments = json.loads(row["comments"] or "[]")
+            # Facebook liefert Ausschnitte. Fehlende Kommentare in einer Antwort
+            # sind kein Nachweis dafür, dass sie gelöscht wurden.
+            merged_comments = stored_comments.copy()
+            for comment in incoming_comments:
+                if comment not in merged_comments:
+                    merged_comments.append(comment)
 
             has_changes = (
                 comment_count > prev_count
                 or (content and content != prev_content)
-                or (comments and comments_json != prev_comments)
+                or merged_comments != stored_comments
             )
 
             if has_changes:
@@ -123,7 +140,7 @@ class StateDB:
                     (
                         author,
                         content,
-                        comments_json,
+                        json.dumps(merged_comments, ensure_ascii=False),
                         timestamp,
                         comment_count,
                         post_url,
@@ -131,7 +148,6 @@ class StateDB:
                         post_id,
                     ),
                 )
-                conn.commit()
                 return True
 
             return False
@@ -158,6 +174,7 @@ class StateDB:
                 SET extracted_actions = ?,
                     needs_analysis = 0,
                     dispatched = 0,
+                    export_started_at = NULL,
                     updated_at = ?
                 WHERE post_id = ?
                 """,
@@ -166,22 +183,30 @@ class StateDB:
             conn.commit()
 
     def get_undispatched_posts(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self.write_transaction() as conn:
+            conn.execute(
+                """
+                UPDATE posts SET export_started_at = ?
+                WHERE needs_analysis = 0 AND extracted_actions IS NOT NULL
+                  AND dispatched = 0 AND export_started_at IS NULL
+                """,
+                (datetime.now(timezone.utc).isoformat(),),
+            )
             rows = conn.execute(
                 """
                 SELECT * FROM posts
-                WHERE extracted_actions IS NOT NULL AND dispatched = 0
+                WHERE needs_analysis = 0 AND extracted_actions IS NOT NULL AND dispatched = 0
                 ORDER BY updated_at ASC
                 """
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def mark_dispatched(self, post_id: str) -> None:
+    def mark_dispatched(self, post_id: str, export_started_at: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             conn.execute(
-                "UPDATE posts SET dispatched = 1, updated_at = ? WHERE post_id = ?",
-                (now, post_id),
+                "UPDATE posts SET dispatched = 1, updated_at = ? WHERE post_id = ? AND export_started_at = ?",
+                (now, post_id, export_started_at),
             )
             conn.commit()
 
@@ -211,7 +236,7 @@ class StateDB:
                 "SELECT COUNT(*) FROM posts WHERE needs_analysis = 1"
             ).fetchone()[0]
             undispatched = conn.execute(
-                "SELECT COUNT(*) FROM posts WHERE extracted_actions IS NOT NULL AND dispatched = 0"
+                "SELECT COUNT(*) FROM posts WHERE needs_analysis = 0 AND extracted_actions IS NOT NULL AND dispatched = 0"
             ).fetchone()[0]
             return {
                 "total_posts": total,

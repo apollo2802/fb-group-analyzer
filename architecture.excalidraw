@@ -542,13 +542,13 @@
       "updated": 1700000000000,
       "link": null,
       "locked": false,
-      "text": "analyzer.py\n\n1. DSGVO-Anonymisierung\n2. Gemini Structured Outputs\n(DerivedActivity)",
+      "text": "analyzer.py\n\n1. Freitext-Maskierung\n2. Gemini Structured Outputs\n(DerivedActivity)",
       "fontSize": 16,
       "fontFamily": 1,
       "textAlign": "center",
       "verticalAlign": "middle",
       "containerId": "analyzer",
-      "originalText": "analyzer.py\n\n1. DSGVO-Anonymisierung\n2. Gemini Structured Outputs\n(DerivedActivity)",
+      "originalText": "analyzer.py\n\n1. Freitext-Maskierung\n2. Gemini Structured Outputs\n(DerivedActivity)",
       "lineHeight": 1.25
     },
     {
@@ -887,13 +887,13 @@
       "updated": 1700000000000,
       "link": null,
       "locked": false,
-      "text": ".env Konfiguration\n\nGEMINI_API_KEY\nFB_GROUP_URL\nANONYMIZE_PII",
+      "text": ".env Konfiguration\n\nGEMINI_API_KEY\nFB_GROUP_URL\nGEMINI_ALLOW_CLOUD",
       "fontSize": 16,
       "fontFamily": 1,
       "textAlign": "center",
       "verticalAlign": "middle",
       "containerId": "env_file",
-      "originalText": ".env Konfiguration\n\nGEMINI_API_KEY\nFB_GROUP_URL\nANONYMIZE_PII",
+      "originalText": ".env Konfiguration\n\nGEMINI_API_KEY\nFB_GROUP_URL\nGEMINI_ALLOW_CLOUD",
       "lineHeight": 1.25
     },
     {
