@@ -167,10 +167,32 @@ def test_gemini_requires_opt_in_and_prompt_masks_known_identifiers() -> None:
             assert identifier not in prompt
 
 
+def test_multi_group_management() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = StateDB(str(Path(tmpdir) / "state.db"))
+        db.ensure_default_group("https://www.facebook.com/groups/111/?sorting_setting=CHRONOLOGICAL", "Gruppe A")
+        gid2 = db.add_group("Gruppe B", "https://www.facebook.com/groups/222/")
+        groups = db.get_groups()
+        assert len(groups) == 2
+        assert groups[0]["url"] == "https://www.facebook.com/groups/111"
+
+        db.update_group(gid2, name="Gruppe B Neu", enabled=False)
+        assert len(db.get_groups(only_enabled=True)) == 1
+        assert db.get_groups()[1]["name"] == "Gruppe B Neu"
+
+        db.upsert_post("p1", "Autor", "Hallo", group_url="https://www.facebook.com/groups/111", group_name="Gruppe A")
+        posts = db.get_all_posts()
+        assert posts[0]["group_name"] == "Gruppe A"
+
+        db.delete_group(gid2)
+        assert len(db.get_groups()) == 1
+
+
 if __name__ == "__main__":
     test_graphql_parser()
     test_anonymizer_and_db_and_dispatcher()
     test_partial_comment_snapshots_preserve_known_comments()
     test_webhook_retry_does_not_duplicate_csv_rows()
     test_gemini_requires_opt_in_and_prompt_masks_known_identifiers()
+    test_multi_group_management()
     print("Alle Pipeline-Tests erfolgreich bestanden!")

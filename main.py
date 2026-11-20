@@ -11,16 +11,21 @@ from dotenv import load_dotenv
 from analyzer import analyze_pending_posts
 from db import StateDB
 from dispatcher import dispatch_activities
-from scraper import scrape_group
+from scraper import scrape_all_groups
 
 load_dotenv()
 
 
-def run_pipeline(debug_graphql: bool = False, visible: bool = False) -> None:
+def run_pipeline(
+    debug_graphql: bool = False,
+    visible: bool = False,
+    scroll_count: int | None = None,
+) -> None:
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starte Pipeline-Durchlauf ...")
     try:
-        scrape_group(
+        scrape_all_groups(
             headless=False if visible else None,
+            scroll_count=scroll_count,
             debug_graphql=debug_graphql,
         )
         analyze_pending_posts()
@@ -37,6 +42,7 @@ def main() -> None:
     parser.add_argument("--dispatch-only", action="store_true", help="Führt nur den Dispatcher aus")
     parser.add_argument("--debug-graphql", action="store_true", help="Speichert rohe GraphQL-Responses zum Debuggen")
     parser.add_argument("--visible", action="store_true", help="Startet den Browser sichtbar (headless=False)")
+    parser.add_argument("--scroll-count", type=int, default=None, help="Anzahl der Scroll-Schritte pro Gruppe")
     parser.add_argument("--stats", action="store_true", help="Zeigt aktuelle Datenbank-Statistiken an")
     args = parser.parse_args()
 
@@ -46,7 +52,11 @@ def main() -> None:
         return
 
     if args.scrape_only:
-        scrape_group(headless=False if args.visible else None, debug_graphql=args.debug_graphql)
+        scrape_all_groups(
+            headless=False if args.visible else None,
+            scroll_count=args.scroll_count,
+            debug_graphql=args.debug_graphql,
+        )
         return
 
     if args.analyze_only:
@@ -58,7 +68,11 @@ def main() -> None:
         return
 
     if args.once:
-        run_pipeline(debug_graphql=args.debug_graphql, visible=args.visible)
+        run_pipeline(
+            debug_graphql=args.debug_graphql,
+            visible=args.visible,
+            scroll_count=args.scroll_count,
+        )
         return
 
     fallback_interval = int(os.getenv("CHECK_INTERVAL_MINUTES", "20"))

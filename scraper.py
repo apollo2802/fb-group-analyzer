@@ -198,40 +198,21 @@ def extract_posts_from_graphql(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(posts.values())
 
 
-def scrape_group(
-    group_url: Optional[str] = None,
-    session_dir: Optional[str] = None,
-    db_path: Optional[str] = None,
-    headless: Optional[bool] = None,
-    scroll_count: Optional[int] = None,
-    scroll_delay: Optional[float] = None,
+def _scrape_single_page(
+    page: Any,
+    group_url: str,
+    group_name: str,
+    db: StateDB,
+    scroll_count: int,
+    scroll_delay: float,
     debug_graphql: bool = False,
+    debug_prefix: str = "graphql",
 ) -> Dict[str, int]:
-    """
-    Öffnet die Facebook-Gruppe mit dem gespeicherten Playwright-Profil,
-    scrollt langsam nach unten, fängt /api/graphql/-Antworten ab und speichert
-    neue oder aktualisierte Posts in state.db.
-    """
-    group_url = (group_url or os.getenv("FB_GROUP_URL", "")).strip()
-    if not group_url or "DEINE_GRUPPE" in group_url:
-        raise ValueError("FB_GROUP_URL ist nicht konfiguriert. Bitte in .env eintragen.")
-
-    # Chronologische Sortierung erzwingen, damit brandneue Beiträge immer ganz oben erscheinen
-    if "sorting_setting=" not in group_url:
-        sep = "&" if "?" in group_url else "?"
-        group_url = f"{group_url}{sep}sorting_setting=CHRONOLOGICAL"
-
-    session_path = Path(session_dir or os.getenv("FB_SESSION_DIR", "./fb_session")).resolve()
-    if not session_path.exists():
-        raise FileNotFoundError(
-            f"Session-Ordner {session_path} existiert nicht. Bitte zuerst 'python auth_setup.py' ausführen."
-        )
-
-    db = StateDB(db_path or os.getenv("DB_PATH", "./state.db"))
-    if headless is None:
-        headless = os.getenv("HEADLESS", "true").lower() == "true"
-    scroll_count = scroll_count if scroll_count is not None else int(os.getenv("SCROLL_COUNT", "4"))
-    scroll_delay = scroll_delay if scroll_delay is not None else float(os.getenv("SCROLL_DELAY_SECONDS", "3.0"))
+    base_url = db.normalize_group_url(group_url)
+    target_url = group_url.strip()
+    if "sorting_setting=" not in target_url:
+        sep = "&" if "?" in target_url else "?"
+        target_url = f"{target_url}{sep}sorting_setting=CHRONOLOGICAL"
 
     debug_dir = Path("./debug_graphql")
     if debug_graphql:
@@ -265,62 +246,50 @@ def scrape_group(
 
         graphql_responses_seen += 1
         if debug_graphql:
-            dump_file = debug_dir / f"graphql_{graphql_responses_seen:03d}.txt"
+            dump_file = debug_dir / f"{debug_prefix}_{graphql_responses_seen:03d}.txt"
             dump_file.write_text(body, encoding="utf-8")
 
         for payload in _parse_ndjson_payload(body):
             for post in extract_posts_from_graphql(payload):
                 merge_post(post)
 
-    print(f"[Scraper] Starte Browser (headless={headless}) für {group_url} ...")
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(session_path),
-            headless=headless,
-            viewport={"width": 1280, "height": 900},
-            locale="de-DE",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.on("response", handle_response)
+    print(f"[Scraper] Lade Gruppe '{group_name}' ({target_url}) ...")
+    page.on("response", handle_response)
+    try:
+        page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(4000)
 
+        if "login" in page.url.lower():
+            raise RuntimeError(
+                "Facebook verlangt einen erneuten Login. Bitte im Dashboard auf 'Login aktualisieren' klicken oder auth_setup.py ausführen."
+            )
+
+        # Initial serverseitig gerenderte (SSR) JSON-Skripte auslesen (enthält die obersten/neuesten Posts!)
         try:
-            page.goto(group_url, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(4000)
+            ssr_scripts = page.locator('script[type="application/json"]').all_text_contents()
+            for raw_json in ssr_scripts:
+                if "post_id" not in raw_json:
+                    continue
+                try:
+                    payload = json.loads(raw_json)
+                    if isinstance(payload, dict):
+                        for post in extract_posts_from_graphql(payload):
+                            merge_post(post)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as exc:
+            print(f"[Scraper] Hinweis beim SSR-JSON-Parsing: {exc}")
 
-            # Prüfen, ob Login-Seite angezeigt wird
-            if "login" in page.url.lower():
-                raise RuntimeError(
-                    "Facebook verlangt einen erneuten Login. Bitte 'python auth_setup.py' erneut ausführen."
-                )
+        for i in range(scroll_count):
+            scroll_px = random.randint(900, 1400)
+            page.mouse.wheel(0, scroll_px)
+            delay = scroll_delay + random.uniform(0.5, 1.8)
+            print(f"[Scraper] [{group_name}] Scroll {i + 1}/{scroll_count} ({scroll_px}px), warte {delay:.1f}s ...")
+            time.sleep(delay)
 
-            # Initial serverseitig gerenderte (SSR) JSON-Skripte auslesen (enthält die obersten/neuesten Posts!)
-            try:
-                ssr_scripts = page.locator('script[type="application/json"]').all_text_contents()
-                for raw_json in ssr_scripts:
-                    if "post_id" not in raw_json:
-                        continue
-                    try:
-                        payload = json.loads(raw_json)
-                        if isinstance(payload, dict):
-                            for post in extract_posts_from_graphql(payload):
-                                merge_post(post)
-                    except json.JSONDecodeError:
-                        continue
-            except Exception as exc:
-                print(f"[Scraper] Hinweis beim SSR-JSON-Parsing: {exc}")
-
-            for i in range(scroll_count):
-                scroll_px = random.randint(900, 1400)
-                page.mouse.wheel(0, scroll_px)
-                delay = scroll_delay + random.uniform(0.5, 1.8)
-                print(f"[Scraper] Scroll {i + 1}/{scroll_count} ({scroll_px}px), warte {delay:.1f}s ...")
-                time.sleep(delay)
-
-            # Kurz warten, damit laufende GraphQL-Requests abgeschlossen werden
-            page.wait_for_timeout(2500)
-        finally:
-            context.close()
+        page.wait_for_timeout(2500)
+    finally:
+        page.remove_listener("response", handle_response)
 
     new_or_updated = 0
     for post in discovered_posts.values():
@@ -332,9 +301,13 @@ def scrape_group(
             comment_count=post["comment_count"],
             comments=post["comments"],
             post_url=post["post_url"],
+            group_url=base_url,
+            group_name=group_name,
         )
         if changed:
             new_or_updated += 1
+
+    db.mark_group_scraped(base_url)
 
     stats = {
         "graphql_responses": graphql_responses_seen,
@@ -342,10 +315,144 @@ def scrape_group(
         "new_or_updated": new_or_updated,
     }
     print(
-        f"[Scraper] Fertig: {stats['graphql_responses']} GraphQL-Antworten, "
+        f"[Scraper] [{group_name}] Fertig: {stats['graphql_responses']} GraphQL-Antworten, "
         f"{stats['posts_extracted']} Posts extrahiert, {stats['new_or_updated']} neu/aktualisiert."
     )
     return stats
+
+
+def scrape_group(
+    group_url: Optional[str] = None,
+    group_name: Optional[str] = None,
+    session_dir: Optional[str] = None,
+    db_path: Optional[str] = None,
+    headless: Optional[bool] = None,
+    scroll_count: Optional[int] = None,
+    scroll_delay: Optional[float] = None,
+    debug_graphql: bool = False,
+) -> Dict[str, int]:
+    """Scrapt eine einzelne Facebook-Gruppe."""
+    group_url = (group_url or os.getenv("FB_GROUP_URL", "")).strip()
+    if not group_url or "DEINE_GRUPPE" in group_url:
+        raise ValueError("FB_GROUP_URL ist nicht konfiguriert. Bitte in .env oder im Dashboard eintragen.")
+
+    session_path = Path(session_dir or os.getenv("FB_SESSION_DIR", "./fb_session")).resolve()
+    if not session_path.exists():
+        raise FileNotFoundError(
+            f"Session-Ordner {session_path} existiert nicht. Bitte zuerst Login durchführen."
+        )
+
+    db = StateDB(db_path or os.getenv("DB_PATH", "./state.db"))
+    if headless is None:
+        headless = os.getenv("HEADLESS", "true").lower() == "true"
+    scroll_count = scroll_count if scroll_count is not None else int(os.getenv("SCROLL_COUNT", "4"))
+    scroll_delay = scroll_delay if scroll_delay is not None else float(os.getenv("SCROLL_DELAY_SECONDS", "3.0"))
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(session_path),
+            headless=headless,
+            viewport={"width": 1280, "height": 900},
+            locale="de-DE",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            return _scrape_single_page(
+                page=page,
+                group_url=group_url,
+                group_name=group_name or "Standard-Gruppe",
+                db=db,
+                scroll_count=scroll_count,
+                scroll_delay=scroll_delay,
+                debug_graphql=debug_graphql,
+            )
+        finally:
+            context.close()
+
+
+def scrape_all_groups(
+    session_dir: Optional[str] = None,
+    db_path: Optional[str] = None,
+    headless: Optional[bool] = None,
+    scroll_count: Optional[int] = None,
+    scroll_delay: Optional[float] = None,
+    debug_graphql: bool = False,
+) -> Dict[str, int]:
+    """
+    Scrapt alle aktivierten Facebook-Gruppen aus state.db in einer gemeinsamen Browser-Session.
+    Falls noch keine Gruppen in state.db gepflegt sind, wird FB_GROUP_URL aus .env automatisch angelegt.
+    """
+    db = StateDB(db_path or os.getenv("DB_PATH", "./state.db"))
+    default_url = os.getenv("FB_GROUP_URL", "").strip()
+    if default_url:
+        db.ensure_default_group(default_url)
+
+    groups = db.get_groups(only_enabled=True)
+    if not groups:
+        raise ValueError(
+            "Keine aktiven Facebook-Gruppen konfiguriert. Bitte im Dashboard unter 'Gruppen & Login' eine Gruppe anlegen."
+        )
+
+    session_path = Path(session_dir or os.getenv("FB_SESSION_DIR", "./fb_session")).resolve()
+    if not session_path.exists():
+        raise FileNotFoundError(
+            f"Session-Ordner {session_path} existiert nicht. Bitte zuerst im Dashboard auf 'Login aktualisieren' klicken."
+        )
+
+    if headless is None:
+        headless = os.getenv("HEADLESS", "true").lower() == "true"
+    scroll_count = scroll_count if scroll_count is not None else int(os.getenv("SCROLL_COUNT", "4"))
+    scroll_delay = scroll_delay if scroll_delay is not None else float(os.getenv("SCROLL_DELAY_SECONDS", "3.0"))
+
+    totals = {
+        "groups_scraped": 0,
+        "graphql_responses": 0,
+        "posts_extracted": 0,
+        "new_or_updated": 0,
+    }
+
+    print(f"[Scraper] Starte Browser (headless={headless}) für {len(groups)} aktive Gruppe(n) ...")
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(session_path),
+            headless=headless,
+            viewport={"width": 1280, "height": 900},
+            locale="de-DE",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            for idx, grp in enumerate(groups, start=1):
+                stats = _scrape_single_page(
+                    page=page,
+                    group_url=grp["url"],
+                    group_name=grp["name"],
+                    db=db,
+                    scroll_count=scroll_count,
+                    scroll_delay=scroll_delay,
+                    debug_graphql=debug_graphql,
+                    debug_prefix=f"group{grp['id']}_graphql",
+                )
+                totals["groups_scraped"] += 1
+                totals["graphql_responses"] += stats["graphql_responses"]
+                totals["posts_extracted"] += stats["posts_extracted"]
+                totals["new_or_updated"] += stats["new_or_updated"]
+
+                # Kurze menschliche Pause zwischen mehreren Gruppen
+                if idx < len(groups):
+                    pause = random.uniform(3.0, 6.0)
+                    print(f"[Scraper] Warte {pause:.1f}s vor der nächsten Gruppe ...")
+                    time.sleep(pause)
+        finally:
+            context.close()
+
+    print(
+        f"[Scraper] Gesamt: {totals['groups_scraped']} Gruppe(n), "
+        f"{totals['graphql_responses']} GraphQL-Antworten, "
+        f"{totals['posts_extracted']} Posts extrahiert, {totals['new_or_updated']} neu/aktualisiert."
+    )
+    return totals
 
 
 if __name__ == "__main__":
@@ -354,7 +461,7 @@ if __name__ == "__main__":
     parser.add_argument("--visible", action="store_true", help="Startet den Browser sichtbar (headless=False)")
     args = parser.parse_args()
 
-    scrape_group(
+    scrape_all_groups(
         headless=False if args.visible else None,
         debug_graphql=args.debug_graphql,
     )

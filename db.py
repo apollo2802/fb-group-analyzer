@@ -59,6 +59,118 @@ class StateDB:
                 conn.execute("ALTER TABLE posts ADD COLUMN status TEXT DEFAULT 'open'")
             if "export_started_at" not in cols:
                 conn.execute("ALTER TABLE posts ADD COLUMN export_started_at TEXT")
+            if "group_url" not in cols:
+                conn.execute("ALTER TABLE posts ADD COLUMN group_url TEXT")
+            if "group_name" not in cols:
+                conn.execute("ALTER TABLE posts ADD COLUMN group_name TEXT")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    enabled INTEGER DEFAULT 1,
+                    last_scraped_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+    @staticmethod
+    def normalize_group_url(url: str) -> str:
+        cleaned = url.strip()
+        if "?" in cleaned:
+            cleaned = cleaned.split("?", 1)[0]
+        return cleaned.rstrip("/")
+
+    def ensure_default_group(self, default_url: str, default_name: str = "Standard-Gruppe") -> None:
+        """Legt FB_GROUP_URL aus .env einmalig als erste Gruppe an, falls noch keine Gruppen existieren."""
+        cleaned = self.normalize_group_url(default_url)
+        if not cleaned or "DEINE_GRUPPE" in cleaned:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self.write_transaction() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+            if count == 0:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO groups (name, url, enabled, created_at)
+                    VALUES (?, ?, 1, ?)
+                    """,
+                    (default_name, cleaned, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE posts
+                    SET group_url = ?, group_name = ?
+                    WHERE group_url IS NULL
+                    """,
+                    (cleaned, default_name),
+                )
+
+    def get_groups(self, only_enabled: bool = False) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            if only_enabled:
+                rows = conn.execute(
+                    "SELECT * FROM groups WHERE enabled = 1 ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM groups ORDER BY id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def add_group(self, name: str, url: str) -> int:
+        cleaned_url = self.normalize_group_url(url)
+        cleaned_name = name.strip() or cleaned_url.rsplit("/", 1)[-1]
+        if not cleaned_url.startswith("http"):
+            raise ValueError("Die Gruppen-URL muss mit http:// oder https:// beginnen.")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.write_transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO groups (name, url, enabled, created_at)
+                VALUES (?, ?, 1, ?)
+                """,
+                (cleaned_name, cleaned_url, now),
+            )
+            return int(cur.lastrowid)
+
+    def update_group(
+        self,
+        group_id: int,
+        name: Optional[str] = None,
+        url: Optional[str] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        with self.write_transaction() as conn:
+            row = conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+            if row is None:
+                return
+            new_name = name.strip() if name is not None and name.strip() else row["name"]
+            new_url = self.normalize_group_url(url) if url is not None and url.strip() else row["url"]
+            new_enabled = int(enabled) if enabled is not None else row["enabled"]
+            conn.execute(
+                "UPDATE groups SET name = ?, url = ?, enabled = ? WHERE id = ?",
+                (new_name, new_url, new_enabled, group_id),
+            )
+            if new_name != row["name"] or new_url != row["url"]:
+                conn.execute(
+                    "UPDATE posts SET group_name = ?, group_url = ? WHERE group_url = ?",
+                    (new_name, new_url, row["url"]),
+                )
+
+    def delete_group(self, group_id: int) -> None:
+        with self.write_transaction() as conn:
+            conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+
+    def mark_group_scraped(self, url: str) -> None:
+        cleaned = self.normalize_group_url(url)
+        now = datetime.now(timezone.utc).isoformat()
+        with self.write_transaction() as conn:
+            conn.execute(
+                "UPDATE groups SET last_scraped_at = ? WHERE url = ?",
+                (now, cleaned),
+            )
 
     def upsert_post(
         self,
@@ -69,6 +181,8 @@ class StateDB:
         comment_count: int = 0,
         comments: Optional[List[Dict[str, Any]]] = None,
         post_url: Optional[str] = None,
+        group_url: Optional[str] = None,
+        group_name: Optional[str] = None,
     ) -> bool:
         """
         Speichert einen neuen Post oder aktualisiert einen bestehenden Post,
@@ -89,9 +203,9 @@ class StateDB:
                     """
                     INSERT INTO posts (
                         post_id, author, content, comments, timestamp,
-                        comment_count, post_url, needs_analysis, dispatched,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                        comment_count, post_url, group_url, group_name,
+                        needs_analysis, dispatched, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
                     """,
                     (
                         post_id,
@@ -101,6 +215,8 @@ class StateDB:
                         timestamp,
                         comment_count,
                         post_url,
+                        self.normalize_group_url(group_url) if group_url else None,
+                        group_name,
                         now,
                         now,
                     ),
@@ -133,6 +249,8 @@ class StateDB:
                         timestamp = COALESCE(?, timestamp),
                         comment_count = MAX(comment_count, ?),
                         post_url = COALESCE(?, post_url),
+                        group_url = COALESCE(?, group_url),
+                        group_name = COALESCE(?, group_name),
                         needs_analysis = 1,
                         updated_at = ?
                     WHERE post_id = ?
@@ -144,6 +262,8 @@ class StateDB:
                         timestamp,
                         comment_count,
                         post_url,
+                        self.normalize_group_url(group_url) if group_url else None,
+                        group_name,
                         now,
                         post_id,
                     ),

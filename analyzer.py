@@ -112,7 +112,10 @@ def analyze_pending_posts(db_path: Optional[str] = None, limit: int = 50, force_
         print("[Analyzer] Keine neuen oder aktualisierten Posts zur Analyse vorhanden.")
         return 0
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
     analyzed_count = 0
 
     for post in pending:
