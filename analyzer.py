@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import date
 from typing import Dict, List, Literal, Optional
 
@@ -117,38 +118,54 @@ def analyze_pending_posts(db_path: Optional[str] = None, limit: int = 50, force_
         http_options=types.HttpOptions(api_version="v1beta"),
     )
     analyzed_count = 0
+    request_delay = float(os.getenv("GEMINI_REQUEST_DELAY_SECONDS", "4.0"))
 
-    for post in pending:
+    for idx, post in enumerate(pending):
         post_id = post["post_id"]
         prompt = build_prompt(post)
 
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=(
-                        "Du bist ein präziser Assistent zur Auswertung von Facebook-Gruppenbeiträgen. "
-                        "Erkenne konkrete Aufgaben, Termine, Fragen oder Bedarfe. "
-                        "Reine Smalltalk- oder Info-Beiträge ohne Handlungsbedarf erhalten is_actionable=false. "
-                        "Bewerte zusätzlich die Grundstimmung (sentiment und sentiment_score von -100 bis +100) "
-                        "basierend auf Tonfall, Lob, Frustration oder gemeldeten Problemen in Post und Kommentaren."
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=(
+                            "Du bist ein präziser Assistent zur Auswertung von Facebook-Gruppenbeiträgen. "
+                            "Erkenne konkrete Aufgaben, Termine, Fragen oder Bedarfe. "
+                            "Reine Smalltalk- oder Info-Beiträge ohne Handlungsbedarf erhalten is_actionable=false. "
+                            "Bewerte zusätzlich die Grundstimmung (sentiment und sentiment_score von -100 bis +100) "
+                            "basierend auf Tonfall, Lob, Frustration oder gemeldeten Problemen in Post und Kommentaren."
+                        ),
+                        response_mime_type="application/json",
+                        response_schema=DerivedActivity,
+                        temperature=0.1,
                     ),
-                    response_mime_type="application/json",
-                    response_schema=DerivedActivity,
-                    temperature=0.1,
-                ),
-            )
-            activity = DerivedActivity.model_validate_json(response.text)
-            db.save_analysis(post_id, activity.model_dump())
-            analyzed_count += 1
-            print(
-                f"[Analyzer] Post {post_id}: actionable={activity.is_actionable} | "
-                f"{activity.category} | {activity.priority} | "
-                f"{activity.sentiment} ({activity.sentiment_score:+d}) | {activity.action_title}"
-            )
-        except Exception as exc:
-            print(f"[Analyzer] Fehler bei Post {post_id}: {exc}")
+                )
+                activity = DerivedActivity.model_validate_json(response.text)
+                db.save_analysis(post_id, activity.model_dump())
+                analyzed_count += 1
+                print(
+                    f"[Analyzer] Post {post_id}: actionable={activity.is_actionable} | "
+                    f"{activity.category} | {activity.priority} | "
+                    f"{activity.sentiment} ({activity.sentiment_score:+d}) | {activity.action_title}"
+                )
+                break
+            except Exception as exc:
+                err_msg = str(exc)
+                if "PerDay" in err_msg:
+                    print(f"[Analyzer] Tageslimit erreicht ({model_name}) – breche weitere Anfragen für diesen Lauf ab.")
+                    return analyzed_count
+                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) and attempt < 2:
+                    wait_sec = 15 * (attempt + 1)
+                    print(f"[Analyzer] Rate-Limit bei Post {post_id} – warte {wait_sec}s und versuche erneut ...")
+                    time.sleep(wait_sec)
+                    continue
+                print(f"[Analyzer] Fehler bei Post {post_id}: {exc}")
+                break
+
+        if idx < len(pending) - 1 and request_delay > 0:
+            time.sleep(request_delay)
 
     print(f"[Analyzer] Fertig: {analyzed_count}/{len(pending)} Posts analysiert.")
     return analyzed_count

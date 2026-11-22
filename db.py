@@ -76,6 +76,33 @@ class StateDB:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def set_runtime_state(self, updates: Dict[str, str]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.write_transaction() as conn:
+            for key, value in updates.items():
+                conn.execute(
+                    """
+                    INSERT INTO runtime_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, value, now),
+                )
+
+    def get_runtime_state(self) -> Dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM runtime_state").fetchall()
+            return {r["key"]: r["value"] for r in rows}
 
     @staticmethod
     def normalize_group_url(url: str) -> str:
@@ -337,6 +364,29 @@ class StateDB:
                 SELECT * FROM posts
                 ORDER BY COALESCE(timestamp, created_at) DESC
                 """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_recent_posts_for_group(
+        self,
+        group_url: str,
+        hours: int = 72,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Liefert die neuesten bekannten Posts einer Gruppe mit Permalink-URL für den Kommentar-Check."""
+        cleaned = self.normalize_group_url(group_url)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM posts
+                WHERE group_url = ?
+                  AND post_url IS NOT NULL
+                  AND post_url != ''
+                  AND datetime(COALESCE(timestamp, created_at)) >= datetime('now', ?)
+                ORDER BY COALESCE(timestamp, created_at) DESC
+                LIMIT ?
+                """,
+                (cleaned, f"-{int(hours)} hours", limit),
             ).fetchall()
             return [dict(r) for r in rows]
 

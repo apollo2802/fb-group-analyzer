@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
@@ -86,10 +87,52 @@ def main() -> None:
         f"({min_minutes}–{max_minutes} Minuten). Beenden mit Strg+C."
     )
 
+    db = StateDB(os.getenv("DB_PATH", "./state.db"))
+    pid_str = str(os.getpid())
+
+    def mark_stopped() -> None:
+        try:
+            current = db.get_runtime_state()
+            if current.get("scheduler_pid") == pid_str:
+                db.set_runtime_state(
+                    {
+                        "scheduler_state": "stopped",
+                        "scheduler_pid": "",
+                        "next_run_at": "",
+                    }
+                )
+        except Exception:
+            pass
+
+    atexit.register(mark_stopped)
+
     scheduler = BlockingScheduler()
 
+    def write_heartbeat() -> None:
+        try:
+            db.set_runtime_state(
+                {
+                    "scheduler_pid": pid_str,
+                    "scheduler_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        except Exception:
+            pass
+
     def run_and_schedule_next() -> None:
-        run_pipeline(debug_graphql=args.debug_graphql, visible=args.visible)
+        db.set_runtime_state(
+            {
+                "scheduler_pid": pid_str,
+                "scheduler_state": "scraping",
+                "last_run_started_at": datetime.now(timezone.utc).isoformat(),
+                "scheduler_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        run_pipeline(
+            debug_graphql=args.debug_graphql,
+            visible=args.visible,
+            scroll_count=args.scroll_count,
+        )
         delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
         next_run = datetime.now() + timedelta(seconds=delay_seconds)
         mins, secs = divmod(delay_seconds, 60)
@@ -97,13 +140,32 @@ def main() -> None:
             f"[Main] Nächster Prüflauf geplant für {next_run.strftime('%H:%M:%S')} "
             f"(in {mins} Min. {secs} Sek.)."
         )
+        db.set_runtime_state(
+            {
+                "scheduler_pid": pid_str,
+                "scheduler_state": "idle",
+                "last_run_finished_at": datetime.now(timezone.utc).isoformat(),
+                "next_run_at": next_run.astimezone().isoformat(),
+                "scheduler_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         scheduler.add_job(
             run_and_schedule_next,
             "date",
             run_date=next_run,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=None,
         )
+
+    scheduler.add_job(
+        write_heartbeat,
+        "interval",
+        seconds=60,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=None,
+    )
 
     # Sofortigen ersten Durchlauf starten und danach zufällig weiterplanen
     run_and_schedule_next()
@@ -111,6 +173,7 @@ def main() -> None:
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
+        mark_stopped()
         print("\n[Main] Scheduler beendet.")
 
 

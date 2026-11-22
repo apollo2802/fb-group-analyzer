@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -400,6 +401,48 @@ def launch_login_browser() -> None:
     subprocess.Popen([sys.executable, "auth_setup.py", "--gui"])
 
 
+def is_pid_running(pid_str: str) -> bool:
+    if not pid_str:
+        return False
+    try:
+        pid = int(pid_str)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def format_time_only(ts: str) -> str:
+    if not ts:
+        return "–"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%H:%M:%S")
+    except ValueError:
+        return ts
+
+
+def start_scheduler_process() -> None:
+    subprocess.Popen(
+        [sys.executable, "-u", "main.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def stop_scheduler_process(pid_str: str) -> None:
+    try:
+        os.kill(int(pid_str), signal.SIGTERM)
+    except Exception:
+        pass
+    db.set_runtime_state(
+        {"scheduler_state": "stopped", "scheduler_pid": "", "next_run_at": ""}
+    )
+
+
 def render_group_barometer_card(
     grp: Dict[str, Any],
     grp_posts: List[Dict[str, Any]],
@@ -698,15 +741,57 @@ with st.sidebar:
     )
     auto_refresh_sec = auto_refresh_options[auto_refresh_label]
 
+    rt = db.get_runtime_state()
     session_ok = SESSION_DIR.exists() and any(SESSION_DIR.iterdir())
-    session_pill = (
-        '<span class="pill pill-active">● Session aktiv</span>'
-        if session_ok
-        else '<span class="pill pill-neg">● Login erforderlich</span>'
-    )
+    fb_session_status = rt.get("fb_session_status", "ok" if session_ok else "expired")
+    fb_session_msg = rt.get("fb_session_message", "")
+
+    if not session_ok or fb_session_status == "expired":
+        session_pill = '<span class="pill pill-neg">● Login abgelaufen!</span>'
+    else:
+        session_pill = '<span class="pill pill-active">● Session aktiv</span>'
+
+    sched_pid = rt.get("scheduler_pid", "")
+    sched_alive = is_pid_running(sched_pid)
+    sched_state = rt.get("scheduler_state", "stopped") if sched_alive else "stopped"
+    next_run_fmt = format_time_only(rt.get("next_run_at", "")) if sched_alive else "–"
+    last_run_fmt = format_time_only(rt.get("last_run_finished_at", ""))
+
+    if sched_alive and sched_state == "scraping":
+        sched_pill = '<span class="pill pill-cat">● Prüflauf aktiv…</span>'
+    elif sched_alive:
+        sched_pill = '<span class="pill pill-active">● Online</span>'
+    else:
+        sched_pill = '<span class="pill pill-neg">● Gestoppt</span>'
+
     st.html(
         f"""
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; margin-bottom:8px;">
+        <div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:12px; padding:10px 12px; margin:10px 0;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                <span style="font-size:0.8rem; font-weight:700; color:#334155;">Scheduler (15–30 Min.)</span>
+                {sched_pill}
+            </div>
+            <div style="font-size:0.75rem; color:#64748B; line-height:1.55;">
+                Nächster Check: <strong>{_esc(next_run_fmt)}</strong><br/>
+                Letzter Lauf: <strong>{_esc(last_run_fmt)}</strong>
+            </div>
+        </div>
+        """
+    )
+
+    if sched_alive:
+        if st.button("⏹️ Scheduler stoppen", width="stretch"):
+            stop_scheduler_process(sched_pid)
+            st.rerun()
+    else:
+        if st.button("▶️ Scheduler starten", type="primary", width="stretch"):
+            start_scheduler_process()
+            st.success("Scheduler wird gestartet…")
+            st.rerun()
+
+    st.html(
+        f"""
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; margin-bottom:8px;">
             <span style="font-size:0.8rem; font-weight:600; color:#475569;">Facebook-Status</span>
             {session_pill}
         </div>
@@ -756,6 +841,19 @@ st.html(
     </div>
     """
 )
+
+# --- Session-Ablauf-Warnung (prominent ganz oben) ---
+if not session_ok or fb_session_status == "expired":
+    alert_left, alert_right = st.columns([4.5, 1.5], vertical_alignment="center")
+    alert_left.error(
+        f"⚠️ **Facebook-Session abgelaufen!** {fb_session_msg or 'Bitte neu einloggen, damit auch private Gruppen weiter gescrapt werden.'}"
+    )
+    if alert_right.button("🔑 Jetzt neu einloggen", key="top_relogin_btn", type="primary", width="stretch"):
+        try:
+            launch_login_browser()
+            st.success("Login-Browser geöffnet – nach dem Login einfach das Fenster schließen.")
+        except Exception as exc:
+            st.error(str(exc))
 
 # --- KPI Strip ---
 total_count = len(scope_posts)
@@ -868,7 +966,7 @@ with tab_cards:
         selected_statuses = st.segmented_control(
             "Status",
             options=["open", "done", "ignored"],
-            default=["open", "done"],
+            default=["open"],
             selection_mode="multi",
             format_func=lambda s: STATUS_LABELS.get(s, s),
             label_visibility="collapsed",
@@ -917,13 +1015,83 @@ with tab_cards:
                 continue
         filtered.append(p)
 
-    st.caption(f"Zeige **{len(filtered)}** von {len(scope_posts)} Beiträgen")
+    # Pagination (Seitenweise blättern bei vielen Beiträgen)
+    filter_signature = (
+        active_group,
+        tuple(sorted(active_statuses)),
+        tuple(sorted(active_sentiments)),
+        tuple(sorted(active_categories)),
+        tuple(sorted(active_priorities)),
+        only_actionable,
+        q,
+    )
+    if st.session_state.get("cards_filter_sig") != filter_signature:
+        st.session_state["cards_filter_sig"] = filter_signature
+        st.session_state["cards_page"] = 1
 
-    if not filtered:
+    st.session_state.setdefault("cards_page", 1)
+
+    p_info, p_size_col = st.columns([4.5, 1.3], vertical_alignment="center")
+    with p_size_col:
+        page_size = st.selectbox(
+            "Pro Seite",
+            options=[10, 20, 50],
+            index=0,
+            key="cards_page_size",
+            label_visibility="collapsed",
+            format_func=lambda n: f"{n} pro Seite",
+        )
+
+    total_filtered = len(filtered)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    current_page = max(1, min(int(st.session_state["cards_page"]), total_pages))
+    st.session_state["cards_page"] = current_page
+
+    start_idx = (current_page - 1) * page_size
+    end_idx = min(start_idx + page_size, total_filtered)
+    page_items = filtered[start_idx:end_idx]
+
+    with p_info:
+        if total_filtered == 0:
+            st.caption(f"Zeige **0** von {len(scope_posts)} Beiträgen")
+        else:
+            st.caption(
+                f"Zeige **{start_idx + 1}–{end_idx}** von **{total_filtered}** gefilterten Beiträgen "
+                f"(Seite **{current_page} / {total_pages}**)"
+            )
+
+    def _render_pager(key_prefix: str) -> None:
+        if total_pages <= 1:
+            return
+        c_prev, c_mid, c_next = st.columns([1.2, 2.6, 1.2], vertical_alignment="center")
+        if c_prev.button(
+            "⬅️ Zurück",
+            key=f"{key_prefix}_prev",
+            disabled=current_page <= 1,
+            width="stretch",
+        ):
+            st.session_state["cards_page"] = current_page - 1
+            st.rerun()
+        c_mid.html(
+            f'<div style="text-align:center; font-size:0.85rem; font-weight:600; color:#475569;">'
+            f"Seite {current_page} von {total_pages}</div>"
+        )
+        if c_next.button(
+            "Weiter ➡️",
+            key=f"{key_prefix}_next",
+            disabled=current_page >= total_pages,
+            width="stretch",
+        ):
+            st.session_state["cards_page"] = current_page + 1
+            st.rerun()
+
+    if not page_items:
         st.info("Keine Beiträge entsprechen den aktuellen Filterkriterien.")
     else:
-        for p in filtered:
+        _render_pager("pager_top")
+        for p in page_items:
             render_activity_card(p)
+        _render_pager("pager_bottom")
 
 with tab_table:
     if not filtered:

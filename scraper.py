@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import random
+import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+import httpx
 from dotenv import load_dotenv
 from playwright.sync_api import Response, sync_playwright
 
@@ -198,6 +202,167 @@ def extract_posts_from_graphql(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(posts.values())
 
 
+def _notify_session_expired(db: StateDB, reason: str) -> None:
+    """Speichert Session-Ablauf in state.db und sendet einmalig macOS-Notification + optional Webhook."""
+    prev_state = db.get_runtime_state()
+    already_notified = prev_state.get("fb_session_status") == "expired"
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    msg = f"{reason} (erkannt: {now_str})"
+
+    db.set_runtime_state(
+        {
+            "fb_session_status": "expired",
+            "fb_session_message": msg,
+        }
+    )
+
+    if already_notified:
+        return
+
+    # 1. Native macOS-Benachrichtigung
+    if platform.system() == "Darwin":
+        try:
+            safe_msg = msg.replace('"', "'")
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{safe_msg}" with title "Facebook Group Analyzer" subtitle "Login abgelaufen"',
+                ],
+                check=False,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    # 2. Optional Webhook benachrichtigen
+    webhook = os.getenv("WEBHOOK_URL", "").strip()
+    if webhook:
+        try:
+            httpx.post(
+                webhook,
+                json={
+                    "event": "session_expired",
+                    "title": "Facebook-Session abgelaufen",
+                    "message": msg,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                timeout=10.0,
+            )
+        except Exception:
+            pass
+
+
+def _load_saved_cookies(context: Any, session_path: Path) -> None:
+    """Lädt gespeicherte Cookies aus storage_state.json in den Headless-Context (umgeht macOS-Keychain-Mismatch)."""
+    state_file = session_path.parent / "storage_state.json"
+    if not state_file.exists():
+        return
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        cookies = data.get("cookies") or []
+        if cookies:
+            context.add_cookies(cookies)
+    except Exception as exc:
+        print(f"[Scraper] Hinweis beim Laden von storage_state.json: {exc}")
+
+
+def _is_facebook_logged_in(context: Any, page_url: str) -> tuple[bool, str]:
+    """Prüft zuverlässig anhand des Facebook-Cookies 'c_user' und der URL, ob die Session aktiv ist."""
+    lower_url = (page_url or "").lower()
+    if any(marker in lower_url for marker in ("/login", "/checkpoint", "two_step_verification", "recover")):
+        return False, "Facebook leitet auf Login/Checkpoint um"
+
+    try:
+        cookies = context.cookies("https://www.facebook.com")
+        has_c_user = any(c.get("name") == "c_user" and c.get("value") for c in cookies)
+        if not has_c_user:
+            return False, "Facebook-Session abgelaufen (Login-Cookie c_user fehlt)"
+    except Exception:
+        pass
+
+    return True, ""
+
+
+def _fetch_comments_for_post(page: Any, post_url: str) -> List[Dict[str, str]]:
+    """Öffnet den Permalink eines Beitrags und sammelt alle geladenen Kommentare aus GraphQL & SSR."""
+    comments: List[Dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def collect_from_payload(payload: Dict[str, Any]) -> None:
+        for c in _extract_comments_from_story(payload):
+            key = (c.get("author", ""), c.get("text", ""))
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                comments.append(c)
+
+    def handle_resp(response: Response) -> None:
+        if "/api/graphql/" not in response.url or response.status != 200:
+            return
+        try:
+            body = response.text()
+        except Exception:
+            return
+        for payload in _parse_ndjson_payload(body):
+            collect_from_payload(payload)
+
+    page.on("response", handle_resp)
+    try:
+        page.goto(post_url, wait_until="domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(3500)
+        # Kurz nach unten scrollen, damit nachgeladene Kommentare per GraphQL ausgelöst werden
+        try:
+            page.mouse.wheel(0, 700)
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+        # Zugeklappte Antworten auf Kommentare ("X Antworten ansehen/anzeigen", "Weitere Kommentare") aufklappen
+        reply_btn_pattern = re.compile(
+            r"(Antwort(?:en)?\s+(?:anzeigen|ansehen)|Weitere\s+Kommentare|Alle\s+\d+\s+Antworten|"
+            r"hat\s+geantwortet|haben\s+geantwortet|View\s+.*repl|View\s+more\s+comments|replied)",
+            re.IGNORECASE,
+        )
+        try:
+            expand_buttons = page.locator('[role="button"]').filter(has_text=reply_btn_pattern)
+            clicked = 0
+            btn_count = min(expand_buttons.count(), 8)
+            for idx in range(btn_count):
+                if clicked >= 6:
+                    break
+                btn = expand_buttons.nth(idx)
+                try:
+                    if btn.is_visible():
+                        btn.click(timeout=2000)
+                        clicked += 1
+                        page.wait_for_timeout(900)
+                except Exception:
+                    continue
+            if clicked > 0:
+                page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+        try:
+            for raw_json in page.locator('script[type="application/json"]').all_text_contents():
+                if "Comment" not in raw_json and '"body"' not in raw_json:
+                    continue
+                try:
+                    payload = json.loads(raw_json)
+                    if isinstance(payload, dict):
+                        collect_from_payload(payload)
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[Scraper] Hinweis beim Laden der Kommentare ({post_url}): {exc}")
+    finally:
+        page.remove_listener("response", handle_resp)
+
+    return comments
+
+
 def _scrape_single_page(
     page: Any,
     group_url: str,
@@ -207,6 +372,8 @@ def _scrape_single_page(
     scroll_delay: float,
     debug_graphql: bool = False,
     debug_prefix: str = "graphql",
+    fetch_comments: bool = True,
+    max_comment_posts: int = 8,
 ) -> Dict[str, int]:
     base_url = db.normalize_group_url(group_url)
     target_url = group_url.strip()
@@ -259,10 +426,19 @@ def _scrape_single_page(
         page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(4000)
 
-        if "login" in page.url.lower():
+        logged_in, reason = _is_facebook_logged_in(page.context, page.url)
+        if not logged_in:
+            _notify_session_expired(db, reason)
             raise RuntimeError(
-                "Facebook verlangt einen erneuten Login. Bitte im Dashboard auf 'Login aktualisieren' klicken oder auth_setup.py ausführen."
+                f"{reason}. Bitte im Dashboard auf 'Login' klicken, um die Session zu erneuern."
             )
+
+        db.set_runtime_state(
+            {
+                "fb_session_status": "ok",
+                "fb_session_message": f"Aktiv (geprüft: {datetime.now().strftime('%d.%m.%Y %H:%M')})",
+            }
+        )
 
         # Initial serverseitig gerenderte (SSR) JSON-Skripte auslesen (enthält die obersten/neuesten Posts!)
         try:
@@ -290,6 +466,50 @@ def _scrape_single_page(
         page.wait_for_timeout(2500)
     finally:
         page.remove_listener("response", handle_response)
+
+    # Bei großen Gruppen liefert der Feed oft keine Kommentare inline mit:
+    # gezielt die Permalinks der neu gefundenen UND der jüngsten bekannten Beiträge (72h) öffnen.
+    if fetch_comments and max_comment_posts > 0:
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for post in discovered_posts.values():
+            if post.get("post_url"):
+                candidates[post["post_id"]] = post
+
+        for db_post in db.get_recent_posts_for_group(base_url, hours=72, limit=max_comment_posts):
+            pid = db_post["post_id"]
+            if pid not in candidates and db_post.get("post_url"):
+                try:
+                    stored_comments = json.loads(db_post.get("comments") or "[]")
+                except json.JSONDecodeError:
+                    stored_comments = []
+                candidates[pid] = {
+                    "post_id": pid,
+                    "author": db_post.get("author") or "Unbekannt",
+                    "content": db_post.get("content") or "",
+                    "comments": stored_comments,
+                    "comment_count": db_post.get("comment_count") or 0,
+                    "timestamp": db_post.get("timestamp"),
+                    "post_url": db_post.get("post_url"),
+                }
+
+        posts_to_check = sorted(
+            candidates.values(),
+            key=lambda p: p.get("timestamp") or "",
+            reverse=True,
+        )[:max_comment_posts]
+
+        for post in posts_to_check:
+            fetched = _fetch_comments_for_post(page, post["post_url"])
+            if fetched:
+                existing_comments = post.get("comments") or []
+                merged = list(existing_comments)
+                for c in fetched:
+                    if c not in merged:
+                        merged.append(c)
+                post["comments"] = merged
+                post["comment_count"] = max(post.get("comment_count") or 0, len(merged))
+                discovered_posts[post["post_id"]] = post
+            time.sleep(random.uniform(1.0, 2.2))
 
     new_or_updated = 0
     for post in discovered_posts.values():
@@ -351,11 +571,13 @@ def scrape_group(
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(session_path),
+            channel="chromium",
             headless=headless,
             viewport={"width": 1280, "height": 900},
             locale="de-DE",
-            args=["--disable-blink-features=AutomationControlled"],
+            args=["--disable-blink-features=AutomationControlled", "--use-mock-keychain"],
         )
+        _load_saved_cookies(context, session_path)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             return _scrape_single_page(
@@ -404,6 +626,8 @@ def scrape_all_groups(
         headless = os.getenv("HEADLESS", "true").lower() == "true"
     scroll_count = scroll_count if scroll_count is not None else int(os.getenv("SCROLL_COUNT", "4"))
     scroll_delay = scroll_delay if scroll_delay is not None else float(os.getenv("SCROLL_DELAY_SECONDS", "3.0"))
+    fetch_comments = os.getenv("FETCH_POST_COMMENTS", "true").lower() == "true"
+    max_comment_posts = int(os.getenv("MAX_COMMENT_POSTS_PER_RUN", "8"))
 
     totals = {
         "groups_scraped": 0,
@@ -416,11 +640,13 @@ def scrape_all_groups(
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(session_path),
+            channel="chromium",
             headless=headless,
             viewport={"width": 1280, "height": 900},
             locale="de-DE",
-            args=["--disable-blink-features=AutomationControlled"],
+            args=["--disable-blink-features=AutomationControlled", "--use-mock-keychain"],
         )
+        _load_saved_cookies(context, session_path)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             for idx, grp in enumerate(groups, start=1):
@@ -433,6 +659,8 @@ def scrape_all_groups(
                     scroll_delay=scroll_delay,
                     debug_graphql=debug_graphql,
                     debug_prefix=f"group{grp['id']}_graphql",
+                    fetch_comments=fetch_comments,
+                    max_comment_posts=max_comment_posts,
                 )
                 totals["groups_scraped"] += 1
                 totals["graphql_responses"] += stats["graphql_responses"]
